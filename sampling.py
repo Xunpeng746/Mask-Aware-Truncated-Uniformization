@@ -62,8 +62,8 @@ class EulerPredictor(Predictor):
         sigma, dsigma = self.noise(t)
         score = score_fn(x, sigma)
 
-        rev_rate = step_size * dsigma[..., None] * self.graph.reverse_rate(x, score)
-        x = self.graph.sample_rate(x, rev_rate)
+        rev_rate = step_size * dsigma[..., None] * self.graph.reverse_rate(x, score) #  Eq. (7): Mid-term \eta * Q_t^\tok * score  = \eta * dsigma * Q^\to * score(x_t, sigma)
+        x = self.graph.sample_rate(x, rev_rate) # Eq. (7): \delta function + reverse rate
         return x
 
 @register_predictor(name="none")
@@ -127,14 +127,24 @@ def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps
     @torch.no_grad()
     def pc_sampler(model):
         sampling_score_fn = mutils.get_score_fn(model, train=False, sampling=True)
-        x = graph.sample_limit(*batch_dims).to(device)
-        timesteps = torch.linspace(1, eps, steps + 1, device=device)
+        x = graph.sample_limit(*batch_dims).to(device) # [B = batch_size, L = model_max_length]
+        timesteps = torch.linspace(1, eps, steps + 1, device=device) # timesteps from 1 to eps \approx 0, corresponds to training time (intput time of DM) from -ln eps to -\ln(1-eps) \approx 0
         dt = (1 - eps) / steps
 
         for i in range(steps):
-            t = timesteps[i] * torch.ones(x.shape[0], 1, device=device)
+            t = timesteps[i] * torch.ones(x.shape[0], 1, device=device) # [B , 1]
             x = projector(x)
             x = predictor.update_fn(sampling_score_fn, x, t, dt)
+
+            # DEBUG: Check when some specific tokens are generated, what is the probability of think token in the next step
+            #        Consider the case when B=1, L=1024, No.Mask=50257, Find indices where values are not 50257
+            non_mask_indices = torch.where(x[0] != 50257)[0]
+            if len(non_mask_indices) > 0:
+                non_mask_values = x[0][non_mask_indices]
+                print(f"Step {i}: Found {len(non_mask_indices)} values not equal to 50257")
+                print(f"  Positions: {non_mask_indices.cpu().tolist()}")
+                print(f"  Values: {non_mask_values.cpu().tolist()}")
+                
             
 
         if denoise:
