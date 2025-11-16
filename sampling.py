@@ -1,4 +1,5 @@
 import abc
+from turtle import update
 import torch
 import torch.nn.functional as F
 from catsample import sample_categorical
@@ -55,6 +56,53 @@ class Predictor(abc.ABC):
         """
         pass
 
+
+
+@register_predictor(name="matu")
+class MatuPredictor(Predictor):
+    def init_timesteps(self, steps, l_noise_eps=1e-3, early_stopping_time=1e-5, device=torch.device('cpu')):
+        self.bigT = -torch.log1p(-(1 - l_noise_eps) * 1) # since in LogLinearNoise, t: [1,0] -> total_noise: [-log(eps), 0] from noise_lib.py
+        self.delta = early_stopping_time # early stopping time delta in MATU
+        ret_timesteps = torch.linspace(0, self.bigT - self.delta, steps + 1, device=device)
+        return ret_timesteps
+
+    def update_fn(self, score_fn, x, t_prev, t_curr):
+        K = self.graph.dim  # vocabulary size
+        numK = (x==K-1).sum(dim=-1) # number of mask tokens
+        beta = K * numK * 1.0 / (torch.exp(self.bigT - t_curr) - 1)
+        innerN = torch.poisson(torch.tensor(beta*(t_curr - t_prev)))
+        z = x.detach().clone()
+        if innerN > 0: 
+            tau_list = torch.rand(innerN) * (t_curr - t_prev) + t_prev
+            for tau in tau_list:
+                score = score_fn(z, self.bigT - tau) # socre at reverse time tau = score at forward time T - tau, SEDD paramterized with forward time.
+                tilde_R = self.graph.reverse_rate(z, score) # [B, L, K] tilde_R[sample, i, j] = Prob(z[z_i->j]||z)
+                tilde_Rz = tilde_R.sum(dim=(1, 2), keepdim=True)
+                # calculate hat_R
+                keep_prob = (tilde_Rz < beta).expand(-1, tilde_R.shape[1], tilde_R.shape[2]) # [B, L, K]
+                factor_expanded = tilde_Rz.view(-1, 1, 1)
+                hat_R = torch.where(keep_prob, tilde_Rz, tilde_Rz / factor_expanded * beta)
+                # show which samples are kept
+                sample_indicator = torch.zeros_like(tilde_Rz, dtype=torch.bool)
+                update_above = tilde_Rz >= beta
+                sample_indicator[update_above] = True
+                update_else = ~update_above
+                p_update = 1 - (tilde_Rz[update_above] / beta)
+                rand_update_probs = torch.rand_like(p_update)
+                sample_indicator[update_else] = rand_update_probs < p_update # [B,1] to show whether the sample is updated
+                # update the sample
+                b_indices = sample_indicator[:, 0].nonzero(as_tuple=True)[0]
+                if b_indices.numel() == 0:
+                    continue
+                sub_hat_R = hat_R[b_indices]
+                update_idx, seq_len, vocab_size = sub_hat_R.shape
+                update_prob = sub_hat_R.view(update_idx, -1)
+                update_prob = update_prob / update_prob.sum(dim=1, keepdim=True)
+                update_pos_token_pairs = torch.multinomial(update_prob, 1).squeeze(dim=1)
+                update_pos = update_pos_token_pairs // vocab_size
+                update_token = update_pos_token_pairs % vocab_size
+                z[b_indices, update_pos] = update_token
+        return z
 
 @register_predictor(name="euler")
 class EulerPredictor(Predictor):
@@ -127,24 +175,22 @@ def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps
     @torch.no_grad()
     def pc_sampler(model):
         sampling_score_fn = mutils.get_score_fn(model, train=False, sampling=True)
-        x = graph.sample_limit(*batch_dims).to(device) # [B = batch_size, L = model_max_length]
-        timesteps = torch.linspace(1, eps, steps + 1, device=device) # timesteps from 1 to eps \approx 0, corresponds to training time (intput time of DM) from -ln eps to -\ln(1-eps) \approx 0
+        x = graph.sample_limit(*batch_dims).to(device) # initial state [B = batch_size, L = model_max_length]
+        
+        if predictor == "matu":
+            timesteps = predictor.init_timesteps(steps, eps, device=device)
+        else:
+            timesteps = torch.linspace(1, eps, steps + 1, device=device) # timesteps from 1 to eps \approx 0, corresponds to training time (intput time of DM) from -ln eps to -\ln(1-eps) \approx 0
+        
         dt = (1 - eps) / steps
 
         for i in range(steps):
-            t = timesteps[i] * torch.ones(x.shape[0], 1, device=device) # [B , 1]
             x = projector(x)
-            x = predictor.update_fn(sampling_score_fn, x, t, dt)
-
-            # DEBUG: Check when some specific tokens are generated, what is the probability of think token in the next step
-            #        Consider the case when B=1, L=1024, No.Mask=50257, Find indices where values are not 50257
-            non_mask_indices = torch.where(x[0] != 50257)[0]
-            if len(non_mask_indices) > 0:
-                non_mask_values = x[0][non_mask_indices]
-                print(f"Step {i}: Found {len(non_mask_indices)} values not equal to 50257")
-                print(f"  Positions: {non_mask_indices.cpu().tolist()}")
-                print(f"  Values: {non_mask_values.cpu().tolist()}")
-                
+            if predictor != "matu":
+                t = timesteps[i] * torch.ones(x.shape[0], 1, device=device) # [B , 1]
+                x = predictor.update_fn(sampling_score_fn, x, t, dt)
+            elif predictor == "matu" and i>0:
+                x = predictor.update_fn(sampling_score_fn, x, timesteps[i], timesteps[i-1])
             
 
         if denoise:
