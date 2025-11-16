@@ -27,7 +27,7 @@ def main():
     '''
 
     sampling_fn = sampling.get_pc_sampler(
-        graph, noise, (args.batch_size, 1024), 'euler', args.steps, device=device
+        graph, noise, (args.batch_size, 1024), 'matu', args.steps, device=device
     )
 
     samples = sampling_fn(model)

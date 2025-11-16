@@ -60,48 +60,67 @@ class Predictor(abc.ABC):
 
 @register_predictor(name="matu")
 class MatuPredictor(Predictor):
-    def init_timesteps(self, steps, l_noise_eps=1e-3, early_stopping_time=1e-5, device=torch.device('cpu')):
-        self.bigT = -torch.log1p(-(1 - l_noise_eps) * 1) # since in LogLinearNoise, t: [1,0] -> total_noise: [-log(eps), 0] from noise_lib.py
+    def __init__(self, graph, noise, bigW=100000):
+        super().__init__(graph, noise)
+        self.bigT = None
+        self.delta = None
+        self.bigW = bigW
+        self.bigK = graph.dim # this K = vocab size matches theoretical results in MATU
+        self.actual_steps = 0
+
+    def init_timesteps(self, steps, batch_dims, l_noise_eps=1e-3, early_stopping_time=1e-5, device=torch.device('cpu')):
+        self.bigT = -torch.log1p(torch.tensor(l_noise_eps-1.0)) # since in LogLinearNoise, t: [1,0] -> total_noise: [-log(eps), 0] from noise_lib.py
         self.delta = early_stopping_time # early stopping time delta in MATU
-        ret_timesteps = torch.linspace(0, self.bigT - self.delta, steps + 1, device=device)
+        self.bigK = int(steps * 1.0 / batch_dims[1]) # related to rejection rate to control final complexity
+        ret_timesteps = torch.linspace(0, self.bigT - self.delta, self.bigW + 1, device=device)
         return ret_timesteps
 
-    def update_fn(self, score_fn, x, t_prev, t_curr):
-        K = self.graph.dim  # vocabulary size
-        numK = (x==K-1).sum(dim=-1) # number of mask tokens
+    def update_fn(self, score_fn, x, t_prev, t_curr, device=torch.device('cpu')):
+        K = self.bigK  # hyper paras
+        numK = (x==self.graph.dim-1).sum(dim=-1) # number of mask tokens
         beta = K * numK * 1.0 / (torch.exp(self.bigT - t_curr) - 1)
-        innerN = torch.poisson(torch.tensor(beta*(t_curr - t_prev)))
+        innerN = int(torch.poisson(torch.tensor(beta*(t_curr - t_prev))).item())
         z = x.detach().clone()
         if innerN > 0: 
-            tau_list = torch.rand(innerN) * (t_curr - t_prev) + t_prev
+            self.actual_steps += innerN
+            tau_list, _ = torch.sort(torch.rand(innerN).to(device) * (t_curr - t_prev) + t_prev)
             for tau in tau_list:
                 score = score_fn(z, self.bigT - tau) # socre at reverse time tau = score at forward time T - tau, SEDD paramterized with forward time.
                 tilde_R = self.graph.reverse_rate(z, score) # [B, L, K] tilde_R[sample, i, j] = Prob(z[z_i->j]||z)
-                tilde_Rz = tilde_R.sum(dim=(1, 2), keepdim=True)
+                # calculate \tilde{R}(z) note to remove the Prob(z||z)
+                tilde_R = tilde_R.clamp_min(0)
+                tilde_Rz = tilde_R.sum(dim=(1, 2), keepdim=True).squeeze(-1) # [B, 1]
                 # calculate hat_R
-                keep_prob = (tilde_Rz < beta).expand(-1, tilde_R.shape[1], tilde_R.shape[2]) # [B, L, K]
+                B = tilde_R.shape[0]
+                keep_prob = (tilde_Rz < beta) \
+                    .reshape(B, 1, 1) \
+                    .expand(B, tilde_R.shape[1], tilde_R.shape[2]) # [B, L, K]
                 factor_expanded = tilde_Rz.view(-1, 1, 1)
-                hat_R = torch.where(keep_prob, tilde_Rz, tilde_Rz / factor_expanded * beta)
+                hat_R = torch.where(keep_prob, tilde_R, tilde_R / factor_expanded * beta)
                 # show which samples are kept
                 sample_indicator = torch.zeros_like(tilde_Rz, dtype=torch.bool)
                 update_above = tilde_Rz >= beta
                 sample_indicator[update_above] = True
                 update_else = ~update_above
-                p_update = 1 - (tilde_Rz[update_above] / beta)
+                p_update = (tilde_Rz[update_else] / beta)
                 rand_update_probs = torch.rand_like(p_update)
                 sample_indicator[update_else] = rand_update_probs < p_update # [B,1] to show whether the sample is updated
                 # update the sample
                 b_indices = sample_indicator[:, 0].nonzero(as_tuple=True)[0]
                 if b_indices.numel() == 0:
                     continue
-                sub_hat_R = hat_R[b_indices]
-                update_idx, seq_len, vocab_size = sub_hat_R.shape
-                update_prob = sub_hat_R.view(update_idx, -1)
-                update_prob = update_prob / update_prob.sum(dim=1, keepdim=True)
-                update_pos_token_pairs = torch.multinomial(update_prob, 1).squeeze(dim=1)
-                update_pos = update_pos_token_pairs // vocab_size
-                update_token = update_pos_token_pairs % vocab_size
-                z[b_indices, update_pos] = update_token
+                sub_hat_R = hat_R[b_indices]    # [B_selected, L, K]
+                position_prob = sub_hat_R.sum(dim=-1)
+                position_sample = torch.multinomial(position_prob, 1) # [B_selected, 1]
+
+                row_indices = torch.arange(sub_hat_R.shape[0], device=device) # [B_selected]
+                position_idxs = position_sample.squeeze(dim=1)
+                row_probs = sub_hat_R[row_indices, position_idxs, :]
+                token_sample = torch.multinomial(row_probs, num_samples=1)
+
+                position_sample = position_sample.squeeze(dim=1)
+                token_sample = token_sample.squeeze(dim=1)
+                z[b_indices, position_sample] = token_sample
         return z
 
 @register_predictor(name="euler")
@@ -177,27 +196,29 @@ def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps
         sampling_score_fn = mutils.get_score_fn(model, train=False, sampling=True)
         x = graph.sample_limit(*batch_dims).to(device) # initial state [B = batch_size, L = model_max_length]
         
-        if predictor == "matu":
-            timesteps = predictor.init_timesteps(steps, eps, device=device)
+        if type(predictor) is MatuPredictor:
+            timesteps = predictor.init_timesteps(steps, batch_dims, device=device)
         else:
             timesteps = torch.linspace(1, eps, steps + 1, device=device) # timesteps from 1 to eps \approx 0, corresponds to training time (intput time of DM) from -ln eps to -\ln(1-eps) \approx 0
         
         dt = (1 - eps) / steps
 
-        for i in range(steps):
-            x = projector(x)
-            if predictor != "matu":
+        
+        
+        if type(predictor) is MatuPredictor:
+            for i in range(predictor.bigW):
+                x = predictor.update_fn(sampling_score_fn, x, timesteps[i], timesteps[i+1], device=device)
+            print(f"actual steps: {predictor.actual_steps}")
+        else:
+            for i in range(steps):
+                x = projector(x)         
                 t = timesteps[i] * torch.ones(x.shape[0], 1, device=device) # [B , 1]
                 x = predictor.update_fn(sampling_score_fn, x, t, dt)
-            elif predictor == "matu" and i>0:
-                x = predictor.update_fn(sampling_score_fn, x, timesteps[i], timesteps[i-1])
-            
-
-        if denoise:
-            # denoising step
-            x = projector(x)
-            t = timesteps[-1] * torch.ones(x.shape[0], 1, device=device)
-            x = denoiser.update_fn(sampling_score_fn, x, t)
+            if denoise:
+                # denoising step
+                x = projector(x)
+                t = timesteps[-1] * torch.ones(x.shape[0], 1, device=device)
+                x = denoiser.update_fn(sampling_score_fn, x, t)  
             
         return x
     
