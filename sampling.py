@@ -68,7 +68,7 @@ class MatuPredictor(Predictor):
         self.bigK = graph.dim # this K = vocab size matches theoretical results in MATU
         self.actual_steps = 0
 
-    def init_timesteps(self, steps, batch_dims, l_noise_eps=1e-3, early_stopping_time=1e-5, device=torch.device('cpu')):
+    def init_timesteps(self, steps, batch_dims, l_noise_eps=1e-3, early_stopping_time=1e-6, device=torch.device('cpu')):
         self.bigT = -torch.log1p(torch.tensor(l_noise_eps-1.0)) # since in LogLinearNoise, t: [1,0] -> total_noise: [-log(eps), 0] from noise_lib.py
         self.delta = early_stopping_time # early stopping time delta in MATU
         self.bigK = int(steps * 1.0 / batch_dims[1]) # related to rejection rate to control final complexity
@@ -84,6 +84,7 @@ class MatuPredictor(Predictor):
         if innerN > 0: 
             self.actual_steps += innerN
             tau_list, _ = torch.sort(torch.rand(innerN).to(device) * (t_curr - t_prev) + t_prev)
+            # print(f"t_curr: {t_curr}, actual steps: {self.actual_steps}")
             for tau in tau_list:
                 score = score_fn(z, self.bigT - tau) # socre at reverse time tau = score at forward time T - tau, SEDD paramterized with forward time.
                 tilde_R = self.graph.reverse_rate(z, score) # [B, L, K] tilde_R[sample, i, j] = Prob(z[z_i->j]||z)
