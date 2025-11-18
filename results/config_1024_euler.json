@@ -1,0 +1,14 @@
+{
+    "model_path": "louaaron/sedd-small",
+    "batch_size": 1,
+    "length": 1024,
+    "steps": 1024,
+    "num": 10,
+    "predictor": "euler",
+    "seed": 42,
+    "save_dir": "./results/",
+    "eval_model_path": "gpt2",
+    "gpu": 0,
+    "perplexity": 40.00275192260742,
+    "entropy": 7.692497491836548
+}

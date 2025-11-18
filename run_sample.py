@@ -40,7 +40,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--length", type=int, default=1024)
     parser.add_argument("--steps", type=int, default=1024)
-    parser.add_argument("--num", type=int, default=2)
+    parser.add_argument("--num", type=int, default=10)
     parser.add_argument("-p", "--predictor", type=str, default="matu", choices=["analytic", "matu", "euler", "none"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", default="./results/")
@@ -94,35 +94,39 @@ def main():
     with torch.no_grad():
         eval_model = GPT2LMHeadModel.from_pretrained(args.eval_model_path).to(device).eval()
         batches = samples.shape[0] // args.batch_size
-        total_perplexity = 0
-        total_entropy = 0
+        total_perplexitys = []
+        total_entropys = []
         
         for i in tqdm(range(batches)):
-            s = samples[i * args.batch_size:(i + 1) * args.batch_size]
-            text_samples = tokenizer.batch_decode(s)
-            
-            # Compute perplexity
-            outputs = eval_model(s, labels=s)
-            loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
-            logits = outputs.logits if hasattr(outputs, 'logits') else outputs[1]
-            logits = logits.transpose(-1, -2)
-            perplexitys = F.cross_entropy(logits[..., :-1], s[..., 1:], reduction="none").mean(dim=-1).exp()
-            
-            # Compute entropy
-            entropys = batch_entropy(s, vocab_size)
-            
-            total_perplexity += perplexitys.mean().item()
-            total_entropy += entropys.mean().item()
-            
-            for j in range(s.shape[0]):
-                res.append({
-                    'text': text_samples[j],
-                    'perplexity': perplexitys[j].item(),
-                    'entropy': entropys[j].item()
-                })
+            try:
+                s = samples[i * args.batch_size:(i + 1) * args.batch_size]
+                text_samples = tokenizer.batch_decode(s)
+                
+                # Compute perplexity
+                outputs = eval_model(s, labels=s)
+                loss = outputs.loss if hasattr(outputs, 'loss') else outputs[0]
+                logits = outputs.logits if hasattr(outputs, 'logits') else outputs[1]
+                logits = logits.transpose(-1, -2)
+                perplexitys = F.cross_entropy(logits[..., :-1], s[..., 1:], reduction="none").mean(dim=-1).exp()
+                
+                # Compute entropy
+                entropys = batch_entropy(s, vocab_size)
+                
+                total_perplexitys.append(perplexitys.mean().item())
+                total_entropys.append(entropys.mean().item())
+                
+                for j in range(s.shape[0]):
+                    res.append({
+                        'text': text_samples[j],
+                        'perplexity': perplexitys[j].item(),
+                        'entropy': entropys[j].item()
+                    })
+            except Exception as e:
+                print(f"Error evaluating sample {i}: {e}")
+                continue
         
-        total_perplexity /= batches
-        total_entropy /= batches
+        total_perplexity = sum(total_perplexitys) / len(total_perplexitys)
+        total_entropy = sum(total_entropys) / len(total_entropys)
         
         print(f"Generative Perplexity: {total_perplexity:.3f}")
         print(f"Generative Entropy: {total_entropy:.3f}")
@@ -142,10 +146,9 @@ def main():
         config_dict['perplexity'] = total_perplexity
         config_dict['entropy'] = total_entropy
     
-    json_path = os.path.join(args.save_dir, f'res_{args.steps}_{args.predictor}.json')
-    with open(json_path, 'w') as f:
+    with open(config_path, 'w') as f:
         json.dump(config_dict, f, indent=4)
-    print(f"Config with metrics saved to {json_path}")
+    print(f"Config with metrics saved to {config_path}")
 
 
 if __name__=="__main__":

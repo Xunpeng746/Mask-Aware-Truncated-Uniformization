@@ -116,24 +116,24 @@ class MatuPredictor(Predictor):
 
                 row_indices = torch.arange(sub_hat_R.shape[0], device=device) # [B_selected]
                 position_idxs = position_sample.squeeze(dim=1)
-                
-                # before:
-                # row_probs = sub_hat_R[row_indices, position_idxs, :]
-                # token_sample = torch.multinomial(row_probs, num_samples=1)
 
-                row_probs = sub_hat_R[row_indices, position_idxs, :]  # [B_selected, K]
+                # before:
+                row_probs = sub_hat_R[row_indices, position_idxs, :]
+                token_sample = torch.multinomial(row_probs, num_samples=1)
+
+                # row_probs = sub_hat_R[row_indices, position_idxs, :]  # [B_selected, K]
                 
-                # If using absorbing graph, exclude mask token (last token) from sampling
-                # to ensure generated tokens are within valid vocab range
-                if self.graph.absorb:
-                    # Exclude mask token (graph.dim - 1) from sampling
-                    vocab_size = self.graph.dim - 1  # actual vocab size without mask token
-                    row_probs_vocab = row_probs[..., :vocab_size]  # [B_selected, vocab_size]
-                    # Renormalize probabilities
-                    row_probs_vocab = row_probs_vocab / row_probs_vocab.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                    token_sample = torch.multinomial(row_probs_vocab, num_samples=1)
-                else:
-                    token_sample = torch.multinomial(row_probs, num_samples=1)
+                # # If using absorbing graph, exclude mask token (last token) from sampling
+                # # to ensure generated tokens are within valid vocab range
+                # if self.graph.absorb:
+                #     # Exclude mask token (graph.dim - 1) from sampling
+                #     vocab_size = self.graph.dim - 1  # actual vocab size without mask token
+                #     row_probs_vocab = row_probs[..., :vocab_size]  # [B_selected, vocab_size]
+                #     # Renormalize probabilities
+                #     row_probs_vocab = row_probs_vocab / row_probs_vocab.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                #     token_sample = torch.multinomial(row_probs_vocab, num_samples=1)
+                # else:
+                #     token_sample = torch.multinomial(row_probs, num_samples=1)
 
                 position_sample = position_sample.squeeze(dim=1)
                 token_sample = token_sample.squeeze(dim=1)

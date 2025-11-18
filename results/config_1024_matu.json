@@ -1,0 +1,14 @@
+{
+    "model_path": "louaaron/sedd-small",
+    "batch_size": 1,
+    "length": 1024,
+    "steps": 1024,
+    "num": 10,
+    "predictor": "matu",
+    "seed": 42,
+    "save_dir": "./results/",
+    "eval_model_path": "gpt2",
+    "gpu": 0,
+    "perplexity": 132.07989654541015,
+    "entropy": 8.05471067428589
+}
