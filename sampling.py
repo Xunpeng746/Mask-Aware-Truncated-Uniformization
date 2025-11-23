@@ -59,11 +59,11 @@ class Predictor(abc.ABC):
 
 @register_predictor(name="matu_1")
 class MatuPredictor1(Predictor):
-    def __init__(self, graph, noise, early_stopping_time=1e-5, bigT=1.0):
+    def __init__(self, graph, noise, bigW_factor=3.0, early_stopping_time=1e-5, bigT=1.0):
         super().__init__(graph, noise)
         self.bigT = 1.0
         self.delta = early_stopping_time
-        self.bigW = int(3 * self.bigT / self.delta)
+        self.bigW = int(bigW_factor * self.bigT / self.delta)
         self.bigK = graph.dim # this K = vocab size matches theoretical results in MATU
         self.actual_steps = 0
         self.num_ideal_beta = 0
@@ -78,6 +78,7 @@ class MatuPredictor1(Predictor):
         sigma, dsigma = self.noise(self.bigT - t_curr) # sigma(1-t) and partial sigma(1-t)/partial t
         beta = dsigma * K * numK * 1.0 / (torch.exp(sigma) - 1)
         innerN = int(torch.poisson(torch.tensor(beta*(t_curr - t_prev))).item())
+        # print(f"t_prev: {t_prev}, t_curr: {t_curr}, beta: {beta}, innerN: {innerN}")
         avg_transition_prob = 0.0
         if innerN > 0: 
             self.actual_steps += innerN
@@ -113,9 +114,7 @@ class MatuPredictor1(Predictor):
                     position_sample = max_indices // self.graph.dim
                     token_sample = max_indices % self.graph.dim
                     x[0, position_sample] = token_sample
-                    self.num_ideal_beta += 1
-                    if self.num_ideal_beta % 100 == 0:
-                        print(f"t: {1-t_prev.item()}, self.num_ideal_beta: {self.num_ideal_beta}")
+                    
                     # print(f"t: {1-t_prev.item()}, position_denoised: {position_sample.item()}, value_denoised: {token_sample.item()}, prob_values: {tilde_R[0][position_sample.item()][token_sample.item()].item()}, max_prob_value: {torch.max(tilde_R).item()}")
 
         return x
@@ -147,6 +146,7 @@ class MatuPredictor(Predictor):
         numK = (x==self.graph.dim-1).sum(dim=-1) # number of mask tokens
         beta = K * numK * 1.0 / (torch.exp(self.bigT - t_curr) - 1)
         innerN = int(torch.poisson(torch.tensor(beta*(t_curr - t_prev))).item())
+        print(f"t_prev: {t_prev}, t_curr: {t_curr}, beta: {beta}, innerN: {innerN}")
         if innerN > 0: 
             self.actual_steps += innerN
             tau_list, _ = torch.sort(torch.rand(innerN).to(device) * (t_curr - t_prev) + t_prev)
@@ -218,23 +218,10 @@ class MatuPredictor(Predictor):
 class EulerPredictor(Predictor):
     def update_fn(self, score_fn, x, t, step_size):
 
-        # debug code
-        prev_unmasked_indices = (x != 50257).nonzero(as_tuple=True)[1]
-        # debug code end
-
         sigma, dsigma = self.noise(t)
         score = score_fn(x, sigma)
         rev_rate = step_size * dsigma[..., None] * self.graph.reverse_rate(x, score) #  Eq. (7): Mid-term \eta * Q_t^\tok * score  = \eta * dsigma * Q^\to * score(x_t, sigma)
         x = self.graph.sample_rate(x, rev_rate) # Eq. (7): \delta function + reverse rate
-
-        # debug code
-        curr_unmasked_indices = (x != 50257).nonzero(as_tuple=True)[1]
-        position_denoised = curr_unmasked_indices[~torch.isin(curr_unmasked_indices, prev_unmasked_indices)]
-        if position_denoised.numel() > 0:
-            position_denoised = position_denoised[0].item()
-            value_denoised = x[0][position_denoised].item()
-            print(f"t: {t}, position_denoised: {position_denoised}, value_denoised: {value_denoised}, prob_values: {rev_rate[0][position_denoised][value_denoised].item()/step_size}, max_prob_value: {torch.max(rev_rate/step_size).item()}")
-        # debug code end
 
         return x
 
@@ -291,16 +278,19 @@ def get_sampling_fn(config, graph, noise, batch_dims, eps, device):
     return sampling_fn
     
 
-def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps=1e-5, device=torch.device('cpu'), proj_fun=lambda x: x):
-    predictor = get_predictor(predictor)(graph, noise)
-    predictor_matu = get_predictor("matu_1")(graph, noise)
+def get_pc_sampler(graph, noise, batch_dims, predictor, steps, hyper_params, denoise=True, eps=1e-5, device=torch.device('cpu'), proj_fun=lambda x: x):
+    if predictor == "matu_1":
+        predictor = MatuPredictor1(graph, noise, bigW_factor=hyper_params['bigW'], early_stopping_time=hyper_params['delta'], bigT=1.0)
+    else:
+        predictor = get_predictor(predictor)(graph, noise)
     projector = proj_fun
     denoiser = Denoiser(graph, noise)
 
     @torch.no_grad()
     def pc_sampler(model):
         sampling_score_fn = mutils.get_score_fn(model, train=False, sampling=True)
-        x = graph.sample_limit(*batch_dims).to(device) # initial state [B = batch_size, L = model_max_length]
+        x = graph.sample_limit(*batch_dims) # initial state [B = batch_size, L = model_max_length]
+        x = x.to(device)
         
         if type(predictor) is MatuPredictor1:
             timesteps = predictor.init_timesteps(steps, batch_dims, device=device)
@@ -317,7 +307,7 @@ def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps
                 x = predictor.update_fn(sampling_score_fn, x, timesteps[i], timesteps[i+1], device=device)
             t_prev = timesteps[predictor.bigW-1]
             step_size = timesteps[predictor.bigW-1] - timesteps[predictor.bigW-2]
-            while ((x == graph.dim-1).sum().item() > 0):
+            while ((x == graph.dim-1).sum().item() > 0) and 1-t_prev > 5e-7:
                 t_curr = min(t_prev + step_size, (predictor.bigT+t_prev)/2.0)
                 # print(f"t_prev: {t_prev}, t_curr: {t_curr}, Mask Num: {(x == graph.dim-1).sum().item()}")
                 x = predictor.update_fn(sampling_score_fn, x, t_prev, t_curr, device=device)
@@ -341,19 +331,6 @@ def get_pc_sampler(graph, noise, batch_dims, predictor, steps, denoise=True, eps
             for i in range(steps):
                 x = projector(x)         
                 t = timesteps[i] * torch.ones(x.shape[0], 1, device=device) # [B , 1]
-                '''
-                if i==1000:
-                    x_matu = x.clone().detach()
-                    x_matu = predictor_matu.update_fn(sampling_score_fn, x_matu, predictor_matu.bigT - t[0], predictor_matu.bigT - t[0] + dt, device=device)
-                '''
-                if i==1000:
-                    x_matu = x.clone().detach()
-                    t_prev = timesteps[i] * torch.ones(x.shape[0], 1, device=device) # [B , 1]
-                    step_size = predictor_matu.delta
-                    while (t_prev[0].item()>timesteps[i+1].item()):
-                        x_matu = predictor_matu.update_fn(sampling_score_fn, x_matu, torch.tensor(predictor_matu.bigT - t_prev[0]), torch.tensor(predictor_matu.bigT - t_prev[0] + step_size), device=device)
-                        t_prev -= step_size
-                    x = x_matu
 
                 x = predictor.update_fn(sampling_score_fn, x, t, dt)
             
